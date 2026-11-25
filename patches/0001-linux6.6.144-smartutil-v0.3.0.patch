@@ -1,16 +1,16 @@
-From 437ecf88655bf6b405eb76516228ebaa88981503 Mon Sep 17 00:00:00 2001
-From: Artecxyz <artecxyz@local>
-Date: Fri, 30 Oct 2026 11:24:49 +0700
-Subject: [PATCH] Smartutil CPUFreq Governor v0.2.0
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Artecxyz <artecxyz404@gmail.com>
+Date: Wed, 25 Nov 2026 11:35:19 +0700
+Subject: [PATCH] Smartutil CPUFreq Governor v0.3.0
 
 ---
  drivers/cpufreq/Kconfig             |   27 +
  drivers/cpufreq/Makefile            |    1 +
- drivers/cpufreq/cpufreq_smartutil.c | 1711 +++++++++++++++++++++++++++
- include/linux/sched/cpufreq.h       |   11 +
- kernel/sched/cpufreq.c              |   13 +
+ drivers/cpufreq/cpufreq_smartutil.c | 2246 +++++++++++++++++++++++++++++++++++
+ include/linux/sched/cpufreq.h       |   12 +
+ kernel/sched/cpufreq.c              |   28 +
  kernel/sched/pelt.c                 |   14 +
- 6 files changed, 1777 insertions(+)
+ 6 files changed, 2328 insertions(+)
  create mode 100644 drivers/cpufreq/cpufreq_smartutil.c
 
 diff --git a/drivers/cpufreq/Kconfig b/drivers/cpufreq/Kconfig
@@ -65,10 +65,10 @@ index e2657bf89735..9efcb6dd7a43 100644
  obj-$(CONFIG_CPUFREQ_DT_PLATDEV)	+= cpufreq-dt-platdev.o
 diff --git a/drivers/cpufreq/cpufreq_smartutil.c b/drivers/cpufreq/cpufreq_smartutil.c
 new file mode 100644
-index 000000000000..eee3eaa6a111
+index 000000000000..050f744ed8cc
 --- /dev/null
 +++ b/drivers/cpufreq/cpufreq_smartutil.c
-@@ -0,0 +1,1711 @@
+@@ -0,0 +1,2246 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Smartutil CPUFreq governor (based on schedutil)
@@ -91,6 +91,12 @@ index 000000000000..eee3eaa6a111
 + * s*(p * lambda): the speed minimizing energy plus latency per unit of
 + * work, from the Energy Model or a cube law.  lambda is the
 + * latency_weight tunable, per mille of lambda_max.
++ *
++ * On top of that sits the efficient-frequency ladder: a list of rungs,
++ * each with the dwell time a request must spend above it before the next
++ * one is unlocked.  It is applied last, so it has the final word on how
++ * far a transient may climb.  Nothing in it reads a utilization signal,
++ * so it only shapes the frequency the governor has already computed.
 + */
 +
 +#include <linux/arch_topology.h>
@@ -113,13 +119,14 @@ index 000000000000..eee3eaa6a111
 +#include <linux/slab.h>
 +#include <linux/spinlock.h>
 +#include <linux/string.h>
++#include <linux/tick.h>
 +#include <uapi/linux/sched/types.h>
 +#include <trace/hooks/sched.h>
 +
 +#define CPUFREQ_SMARTUTIL_PROGNAME "Smartutil CPUFreq Governor"
 +#define CPUFREQ_SMARTUTIL_AUTHOR   "Artecxyz"
 +
-+#define CPUFREQ_SMARTUTIL_VERSION  "0.2.0"
++#define CPUFREQ_SMARTUTIL_VERSION  "0.3.0"
 +
 +/* SCHED_FLAG_SUGOV is private to kernel/sched/sched.h; hardcode here. */
 +#define SCHED_FLAG_SUGOV	0x10000000
@@ -149,6 +156,15 @@ index 000000000000..eee3eaa6a111
 + */
 +#define SMUT_LATENCY_WEIGHT_DEF	216
 +#define SMUT_LATENCY_WEIGHT_LIM	100000
++
++/* Longest efficient-frequency ladder, and the largest up_delay, in ms. */
++#define SMUT_LADDER_MAX		16
++#define SMUT_UP_DELAY_LIM	60000
++/*
++ * Room for the two lists as text: 16 entries of ten digits plus a separator,
++ * and a newline.  Far under a page, so the show helpers need no PAGE_SIZE.
++ */
++#define SMUT_LADDER_TEXT	(SMUT_LADDER_MAX * 12 + 2)
 +
 +struct smut_tunables {
 +	struct gov_attr_set	attr_set;
@@ -185,6 +201,17 @@ index 000000000000..eee3eaa6a111
 +	 * lambda_max. See smut_speed_floors().
 +	 */
 +	unsigned int		latency_weight;
++
++	/*
++	 * The efficient-frequency ladder: rungs in kHz, and the dwell each one
++	 * buys in ns. Empty (zero entries) disables the ladder. Written by
++	 * sysfs, resolved per policy by smut_ladder_rebuild(), read only from
++	 * there and from the update path's per-policy copy.
++	 */
++	unsigned int		*efficient_freq;
++	unsigned int		nefficient_freq;
++	u64			*up_delay;
++	unsigned int		nup_delay;
 +};
 +
 +struct smut_policy {
@@ -209,6 +236,17 @@ index 000000000000..eee3eaa6a111
 +	unsigned int		cap_light;
 +	unsigned int		cap_mid;
 +	unsigned int		cap_heavy;
++
++	/*
++	 * The ladder resolved for this policy, so a cluster only ever sees the
++	 * rungs it can actually reach. nrung counts them; nrung == 0 disables
++	 * the ladder for this policy. Published last, read on the update path.
++	 */
++	unsigned int		rung[SMUT_LADDER_MAX];
++	u64			rung_delay_ns[SMUT_LADDER_MAX];
++	unsigned int		nrung;
++	int			step;		/* rung in force, nrung = none */
++	u64			step_since;	/* when the hold started, 0 = none */
 +#ifdef CONFIG_ENERGY_MODEL
 +	struct em_perf_domain	*em_pd;
 +	struct em_perf_table __rcu *em_table;	/* the table floor[] came from */
@@ -238,6 +276,14 @@ index 000000000000..eee3eaa6a111
 +	unsigned long		util;
 +	unsigned long		bw_dl;
 +	unsigned long		bw_max;
++
++	/*
++	 * The field below is for single-CPU policies only: the count of
++	 * times this CPU has entered nohz idle, as of the last update.
++	 */
++#ifdef CONFIG_NO_HZ_COMMON
++	unsigned long		saved_idle_calls;
++#endif
 +
 +	/*
 +	 * Measured demand, closed on this CPU only: kcpustat of a remote CPU
@@ -330,9 +376,20 @@ index 000000000000..eee3eaa6a111
 +	if (!cpufreq_this_cpu_can_update(sg_policy->policy))
 +		return false;
 +
-+	if (unlikely(sg_policy->limits_changed)) {
-+		sg_policy->limits_changed = false;
++	if (unlikely(READ_ONCE(sg_policy->limits_changed))) {
++		WRITE_ONCE(sg_policy->limits_changed, false);
 +		sg_policy->need_freq_update = true;
++
++		/*
++		 * The above limits_changed update must occur before the reads
++		 * of policy limits in cpufreq_driver_resolve_freq() or a policy
++		 * limits update might be missed, so use a memory barrier to
++		 * ensure it.
++		 *
++		 * This pairs with the write memory barrier in smut_limits().
++		 */
++		smp_mb();
++
 +		return true;
 +	}
 +
@@ -348,7 +405,9 @@ index 000000000000..eee3eaa6a111
 +static bool smut_update_next_freq(struct smut_policy *sg_policy, u64 time,
 +				   unsigned int next_freq)
 +{
-+	if (sg_policy->need_freq_update) {
++	bool limits_changed = sg_policy->need_freq_update;
++
++	if (limits_changed) {
 +		sg_policy->need_freq_update = false;
 +		/*
 +		 * The policy limits have changed, but if
@@ -365,11 +424,23 @@ index 000000000000..eee3eaa6a111
 +	}
 +
 +	/*
-+	 * Now that the direction of the transition is known, apply the rate
-+	 * limit for that direction only.
++	 * A limits change is not a frequency transition to throttle: the
++	 * hardware may be running outside the new limits right now, so it
++	 * must be applied at once. Only an ordinary transition pays the
++	 * direction-specific rate limit.
 +	 */
-+	if (smut_up_down_rate_limit(sg_policy, time, next_freq))
++	if (!limits_changed &&
++	    smut_up_down_rate_limit(sg_policy, time, next_freq)) {
++		/*
++		 * The target was not applied. Drop the raw-frequency cache:
++		 * otherwise the next call with the same utilization takes the
++		 * cache hit in smut_next_freq() and this transition is lost
++		 * until utilization changes, instead of being retried when
++		 * the limit expires.
++		 */
++		sg_policy->cached_raw_freq = UINT_MAX;
 +		return false;
++	}
 +
 +	sg_policy->next_freq = next_freq;
 +	sg_policy->last_freq_update_time = time;
@@ -794,12 +865,190 @@ index 000000000000..eee3eaa6a111
 +	return min_t(u64, div64_u64((u64)floor * max_cap, ref), max_cap);
 +}
 +
++/*********************** Efficient-frequency ladder ***********************/
++
++/*
++ * A governor that answers the first sign of load with fmax spends its time
++ * at frequencies that buy very little work for a lot of power. Between
++ * policy->min and fmax sit a few speeds where the core does most of its
++ * work per watt; the ladder names them, and a request may climb past one
++ * only after it has stayed above it for that rung's dwell time.  Rising is
++ * therefore paid for in time, per rung, while falling is still immediate.
++ *
++ * The ladder never reads a utilization signal -- it only shapes a frequency
++ * the governor has already computed -- so it is independent of how demand
++ * is measured.  PELT, the measured demand, uclamp and the floor are
++ * untouched, and nothing here calls into a scheduler-specific API.
++ *
++ * The ladder is applied last, after the mapping, the tier ceiling and the
++ * floor, so it has the final word.  That ordering is what makes it worth
++ * having alongside the floor: the floor would otherwise lift a saturated
++ * CPU straight to its efficiency point on the first interval, and the dwell
++ * is exactly what a transient has to survive before it is believed.
++ *
++ * Two properties matter here:
++ *
++ *  - the position (step, step_since) is per policy, not in the tunables,
++ *    so a cluster climbing cannot unlock another cluster's rungs.
++ *  - the rungs are resolved per policy, so one list serves clusters with
++ *    different fmax: entries above a cluster's range clamp to it and
++ *    duplicates collapse.
++ */
++
++/*
++ * Resolve the tunables' list into this policy's rungs.  Called at start, on
++ * a limits change (policy->min/max may have moved) and after a store.
++ */
++static void smut_ladder_rebuild(struct smut_policy *sg_policy)
++{
++	struct smut_tunables *tunables = sg_policy->tunables;
++	struct cpufreq_policy *policy = sg_policy->policy;
++	unsigned int freq[SMUT_LADDER_MAX];
++	u64 delay[SMUT_LADDER_MAX];
++	unsigned int nrung = 0, nfreq, ndelay, i;
++
++	/* Take the ladder out of service while its rungs are rewritten. */
++	WRITE_ONCE(sg_policy->nrung, 0);
++
++	nfreq = READ_ONCE(tunables->nefficient_freq);
++	ndelay = READ_ONCE(tunables->nup_delay);
++
++	for (i = 0; i < nfreq; i++) {
++		unsigned int f = READ_ONCE(tunables->efficient_freq[i]);
++
++		/*
++		 * Zero is how an empty or partly filled list arrives, and a
++		 * rung of zero would clamp every request to nothing, so it
++		 * reads as "unset" here.  An empty list disables the ladder.
++		 */
++		if (!f)
++			continue;
++
++		f = clamp_t(unsigned int, f, policy->min,
++			    policy->cpuinfo.max_freq);
++
++		/* Keep the rungs strictly ascending; drop duplicates. */
++		if (nrung && f <= freq[nrung - 1])
++			continue;
++
++		/*
++		 * Paired with up_delay by position; a short up_delay list
++		 * repeats its last entry instead of reading past the end of
++		 * the array.  One dwell for every rung is written as "50",
++		 * a per-rung ladder as "50 60 90".
++		 */
++		delay[nrung] = ndelay ?
++			READ_ONCE(tunables->up_delay[min(i, ndelay - 1)]) : 0;
++
++		freq[nrung++] = f;
++	}
++
++	for (i = 0; i < nrung; i++) {
++		WRITE_ONCE(sg_policy->rung[i], freq[i]);
++		WRITE_ONCE(sg_policy->rung_delay_ns[i], delay[i]);
++	}
++
++	/*
++	 * Published last, and taken away first: the count goes to zero while
++	 * the rungs are being written, so a concurrent update sees either no
++	 * ladder or the finished one.  A torn u64 delay on a 32-bit build is
++	 * what that guards against -- the count is the only thing standing
++	 * between the reader and a half-written array.
++	 */
++	WRITE_ONCE(sg_policy->nrung, nrung);
++
++	if (sg_policy->step > (int)nrung)
++		sg_policy->step = nrung;
++}
++
++/*
++ * Shape the request.  Held at the rung in force until that rung's dwell has
++ * passed, then the next rung is unlocked and pays its own dwell in turn; a
++ * request that falls back to or under the rung in force drops the ladder to
++ * the nearest rung at or above it at once.
++ *
++ * @time is the scheduler clock of this update, the same one the rate limits
++ * use, so a dwell written in milliseconds is measured in milliseconds.
++ * @capped is set when the ladder actually returned less than @freq, so the
++ * caller knows a later floor must not override the ladder.
++ */
++static unsigned int smut_ladder_apply(struct smut_policy *sg_policy,
++				      unsigned int freq, u64 time, bool *capped)
++{
++	unsigned int nrung = READ_ONCE(sg_policy->nrung);
++	unsigned int ceiling, next;
++	int step, i;
++
++	if (capped)
++		*capped = false;
++
++	if (!nrung)
++		return freq;
++
++	step = sg_policy->step;
++	if (step > (int)nrung)
++		step = sg_policy->step = nrung;
++
++	/* step == nrung: every rung is unlocked, nothing is held back. */
++	ceiling = step == (int)nrung ? UINT_MAX :
++		  READ_ONCE(sg_policy->rung[step]);
++
++	if (freq <= ceiling) {
++		/*
++		 * At or under the rung in force: sit on the nearest rung at
++		 * or above the request and drop the hold, so a later climb
++		 * pays its dwell again.  Nothing is raised to a rung here --
++		 * the ladder caps, it does not floor.
++		 */
++		for (i = 0; i < (int)nrung; i++)
++			if (READ_ONCE(sg_policy->rung[i]) >= freq)
++				break;
++
++		sg_policy->step = i;
++		sg_policy->step_since = 0;
++		return freq;
++	}
++
++	/* Above the rung in force: hold at it until its dwell has passed. */
++	if (!sg_policy->step_since) {
++		sg_policy->step_since = time;
++		if (capped)
++			*capped = true;
++		return ceiling;
++	}
++
++	if ((s64)(time - sg_policy->step_since) <
++	    (s64)READ_ONCE(sg_policy->rung_delay_ns[step])) {
++		if (capped)
++			*capped = true;
++		return ceiling;
++	}
++
++	/*
++	 * Dwell paid.  Unlock the next rung, which then has to be held for its
++	 * own dwell; from the top there is nowhere higher to go, so the whole
++	 * range above it opens at once.
++	 */
++	sg_policy->step = step + 1;
++	sg_policy->step_since = step + 1 < (int)nrung ? time : 0;
++
++	if (step + 1 < (int)nrung) {
++		next = READ_ONCE(sg_policy->rung[step + 1]);
++		if (capped)
++			*capped = next < freq;
++		return min(freq, next);
++	}
++
++	return freq;
++}
++
 +/**
 + * smut_next_freq - Compute a new frequency for a given cpufreq policy.
 + * @sg_policy: smartutil policy object to compute the new frequency for.
 + * @util: Current CPU utilization.
 + * @max: CPU capacity.
 + * @floor: Speed floor in kHz (0 for none), from the measured demand.
++ * @time: Scheduler clock of this update, for the ladder's dwells.
 + *
 + * The base mapping is strictly proportional, with no fixed headroom, so a
 + * lightly loaded CPU is driven towards policy->min:
@@ -814,10 +1063,15 @@ index 000000000000..eee3eaa6a111
 + *
 + * Those three points are joined, not switched: the headroom and the
 + * ceiling are interpolated between them, so the mapping stays continuous
-+ * across the load range.  Each tier's cap is a percentage of
-+ * policy->cpuinfo.max_freq, bounds the result regardless of utilization,
-+ * and is the main heat control. The floor lifts the result but never
-+ * above that ceiling.
++ * across the load range.  Each tier's cap is a percentage of the top
++ * state's power, bounds the result regardless of utilization, and is the
++ * main heat control. The floor lifts the result but never above that
++ * ceiling. It is applied even when a vendor hook supplies the base, and
++ * again after OPP resolution so rounding cannot eat it; only the ladder
++ * may cap below it. Last of all the efficient-frequency ladder caps what
++ * survives: a rung is the highest frequency a request may use until it has
++ * been held for that rung's dwell, so a transient cannot spend the range
++ * above the rung it started in. See smut_ladder_apply().
 + */
 +/*
 + * The per-tier headroom as signed per-mille: +boost_light_pct at idle,
@@ -880,20 +1134,32 @@ index 000000000000..eee3eaa6a111
 +
 +static unsigned int smut_next_freq(struct smut_policy *sg_policy,
 +				   unsigned long util, unsigned long max,
-+				   unsigned int floor)
++				   unsigned int floor, u64 time)
 +{
 +	struct cpufreq_policy *policy = sg_policy->policy;
-+	unsigned int freq, cap_freq;
++	unsigned int freq, cap_freq, floor_freq = 0, resolved;
 +	unsigned long next_freq = 0;
 +	unsigned long load = 100 * util / max;
 +	int permille;
++	bool ladder_capped = false;
 +
 +	freq = smut_capacity_ref_freq(policy);
++	cap_freq = smut_tier_cap(sg_policy, load);
++	if (floor)
++		floor_freq = min_t(unsigned int, floor, cap_freq);
 +
 +	trace_android_vh_map_util_freq(util, freq, max, &next_freq, policy,
 +				       &sg_policy->need_freq_update);
 +	if (next_freq) {
++		/*
++		 * The hook owns the mapping, but the floor is a latency
++		 * promise, not part of the mapping. Keep it even here, and
++		 * let the tier ceiling bound it exactly as it bounds the
++		 * built-in floor.
++		 */
 +		freq = next_freq;
++		if (floor_freq)
++			freq = max_t(unsigned int, freq, floor_freq);
 +	} else {
 +		freq = map_util_freq(util, freq, max);
 +
@@ -910,24 +1176,49 @@ index 000000000000..eee3eaa6a111
 +			freq += (unsigned int)((u64)freq * permille / 1000);
 +		else if (permille < 0)
 +			freq -= (unsigned int)((u64)freq * -permille / 1000);
-+		cap_freq = smut_tier_cap(sg_policy, load);
 +
 +		freq = min_t(unsigned int, freq, cap_freq);
 +
-+		/*
-+		 * The floor raises the target, but never past the tier ceiling:
-+		 * the caps are the heat control and they keep the last word.
-+		 */
-+		if (floor)
-+			freq = max_t(unsigned int, freq, min_t(unsigned int,
-+							       floor, cap_freq));
++		if (floor_freq)
++			freq = max_t(unsigned int, freq, floor_freq);
 +	}
++
++	/*
++	 * The ladder gets the last word, whether the mapping or the vendor
++	 * hook produced the request: it caps how far one update may climb,
++	 * which is the whole point of it being here rather than in the
++	 * mapping.
++	 */
++	freq = smut_ladder_apply(sg_policy, freq, time, &ladder_capped);
 +
 +	if (freq == sg_policy->cached_raw_freq && !sg_policy->need_freq_update)
 +		return sg_policy->next_freq;
 +
 +	sg_policy->cached_raw_freq = freq;
-+	return cpufreq_driver_resolve_freq(policy, freq);
++
++	resolved = cpufreq_driver_resolve_freq(policy, freq);
++
++	/*
++	 * If the target frequency is less than 20% above the lower frequency,
++	 * use that lower frequency: the last fifth of an OPP step buys little
++	 * and costs the whole step.
++	 */
++	if (resolved > freq && freq > 0) {
++		unsigned int l_freq = cpufreq_driver_resolve_freq(policy,
++								  freq - 1);
++
++		if (freq - l_freq < l_freq / 5)
++			resolved = l_freq;
++	}
++
++	/*
++	 * Resolution can round the floor away. The ladder is the final cap,
++	 * so leave its result alone when it actually held the request back.
++	 */
++	if (floor_freq && !ladder_capped && resolved < floor_freq)
++		resolved = floor_freq;
++
++	return resolved;
 +}
 +
 +/*
@@ -1079,13 +1370,39 @@ index 000000000000..eee3eaa6a111
 +}
 +
 +/*
++ * Whether this CPU has been idle since the governor last looked.
++ *
++ * The nohz idle-entry counter only moves when the CPU actually goes
++ * idle, so an unchanged count means it has not: every interval since the
++ * last update was spent running something.  A utilization that has
++ * fallen in the meantime is a run of work ending, not a load going away,
++ * and paying a transition for it buys nothing.
++ *
++ * This is the whole of schedutil's answer to a twitchy frequency, and it
++ * is only meaningful on the single-CPU paths, where the callback is for
++ * one CPU and its rq is held.
++ */
++#ifdef CONFIG_NO_HZ_COMMON
++static bool smut_cpu_is_busy(struct smut_cpu *sg_cpu)
++{
++	unsigned long idle_calls = tick_nohz_get_idle_calls_cpu(sg_cpu->cpu);
++	bool ret = idle_calls == sg_cpu->saved_idle_calls;
++
++	sg_cpu->saved_idle_calls = idle_calls;
++	return ret;
++}
++#else
++static inline bool smut_cpu_is_busy(struct smut_cpu *sg_cpu) { return false; }
++#endif /* CONFIG_NO_HZ_COMMON */
++
++/*
 + * Make smut_should_update_freq() ignore the rate limit when DL
 + * has increased the utilization.
 + */
 +static inline void smut_ignore_dl_rate_limit(struct smut_cpu *sg_cpu)
 +{
 +	if (cpufreq_cpu_dl_bw(sg_cpu->cpu) > sg_cpu->bw_dl)
-+		sg_cpu->sg_policy->limits_changed = true;
++		WRITE_ONCE(sg_cpu->sg_policy->limits_changed, true);
 +}
 +
 +static inline bool smut_update_single_common(struct smut_cpu *sg_cpu,
@@ -1116,15 +1433,31 @@ index 000000000000..eee3eaa6a111
 +	struct smut_cpu *sg_cpu = container_of(hook, struct smut_cpu, update_util);
 +	struct smut_policy *sg_policy = sg_cpu->sg_policy;
 +	unsigned long max_cap;
-+	unsigned int next_f;
++	unsigned int cached_freq, next_f;
 +
++	cached_freq = sg_policy->cached_raw_freq;
 +	max_cap = arch_scale_cpu_capacity(sg_cpu->cpu);
 +
 +	if (!smut_update_single_common(sg_cpu, time, max_cap, flags))
 +		return;
 +
 +	next_f = smut_next_freq(sg_policy, sg_cpu->util, max_cap,
-+			       smut_floor(sg_cpu, max_cap));
++			       smut_floor(sg_cpu, max_cap), time);
++
++	/*
++	 * Do not reduce the frequency if the CPU has not been idle
++	 * recently, as the reduction is likely to be premature then.
++	 *
++	 * Except when the rq is capped by uclamp_max.
++	 */
++	if (!cpufreq_rq_is_capped(sg_cpu->cpu) &&
++	    smut_cpu_is_busy(sg_cpu) && next_f < sg_policy->next_freq &&
++	    !sg_policy->need_freq_update) {
++		next_f = sg_policy->next_freq;
++
++		/* Restore cached freq as next_freq has changed. */
++		sg_policy->cached_raw_freq = cached_freq;
++	}
 +
 +	if (!smut_update_next_freq(sg_policy, time, next_f))
 +		return;
@@ -1147,14 +1480,21 @@ index 000000000000..eee3eaa6a111
 +				     unsigned int flags)
 +{
 +	struct smut_cpu *sg_cpu = container_of(hook, struct smut_cpu, update_util);
-+	unsigned long max_cap;
++	unsigned long max_cap, prev_util = sg_cpu->util;
 +
 +	/*
 +	 * Fall back to the "frequency" path if frequency invariance is not
 +	 * supported, because the direct mapping between utilization and the
 +	 * performance levels depends on it.
++	 *
++	 * The same goes for a configured efficient-frequency ladder: it is a
++	 * policy about frequencies, so on the performance-level path it would
++	 * simply not exist. Rather than let it silently do nothing on SCMI,
++	 * CPPC and the other adjust_perf drivers, take the frequency path and
++	 * give the ladder its say.
 +	 */
-+	if (!arch_scale_freq_invariant()) {
++	if (!arch_scale_freq_invariant() ||
++	    READ_ONCE(sg_cpu->sg_policy->nrung)) {
 +		smut_update_single_freq(hook, time, flags);
 +		return;
 +	}
@@ -1163,6 +1503,17 @@ index 000000000000..eee3eaa6a111
 +
 +	if (!smut_update_single_common(sg_cpu, time, max_cap, flags))
 +		return;
++
++	/*
++	 * Do not reduce the target performance level if the CPU has not
++	 * been idle recently, as the reduction is likely to be premature
++	 * then.
++	 *
++	 * Except when the rq is capped by uclamp_max.
++	 */
++	if (!cpufreq_rq_is_capped(sg_cpu->cpu) &&
++	    smut_cpu_is_busy(sg_cpu) && sg_cpu->util < prev_util)
++		sg_cpu->util = prev_util;
 +
 +	/*
 +	 * The floor is handed over in capacity units. The per-tier ceilings
@@ -1196,7 +1547,7 @@ index 000000000000..eee3eaa6a111
 +		floor = max(floor, smut_floor(j_sg_cpu, max_cap));
 +	}
 +
-+	return smut_next_freq(sg_policy, util, max_cap, floor);
++	return smut_next_freq(sg_policy, util, max_cap, floor, time);
 +}
 +
 +static void
@@ -1271,6 +1622,13 @@ index 000000000000..eee3eaa6a111
 +static struct smut_tunables *smut_global_tunables;
 +static DEFINE_MUTEX(smut_global_tunables_lock);
 +
++/*
++ * Serializes the ladder's tunables and the per-policy rungs derived from
++ * them: two stores, or a store racing a governor start, must not swap the
++ * list from under a rebuild.
++ */
++static DEFINE_MUTEX(smut_ladder_lock);
++
 +static inline struct smut_tunables *to_smut_tunables(struct gov_attr_set *attr_set)
 +{
 +	return container_of(attr_set, struct smut_tunables, attr_set);
@@ -1327,7 +1685,7 @@ index 000000000000..eee3eaa6a111
 +	tunables->name = val;						\
 +									\
 +	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook) { \
-+		sg_policy->field = val * NSEC_PER_USEC;			\
++		sg_policy->field = (s64)val * NSEC_PER_USEC;		\
 +		smut_update_min_rate_limit_ns(sg_policy);		\
 +	}								\
 +									\
@@ -1407,6 +1765,149 @@ index 000000000000..eee3eaa6a111
 +
 +static struct governor_attr latency_weight = __ATTR_RW(latency_weight);
 +
++/*
++ * The ladder's two lists.  A list is parsed into a fresh array, published
++ * under smut_ladder_lock with the per-policy rungs rebuilt from it, and only
++ * then is the array it replaced freed, so a rebuild never reads a list that
++ * a second writer has already released.
++ */
++static int smut_parse_list(unsigned int *out, unsigned int max,
++			   const char *buf, unsigned int *n)
++{
++	char *list, *p, *tok;
++	unsigned int count = 0;
++
++	list = kstrdup(buf, GFP_KERNEL);
++	if (!list)
++		return -ENOMEM;
++
++	p = list;
++	while ((tok = strsep(&p, " \t\n")) != NULL) {
++		unsigned int val;
++
++		if (!*tok)
++			continue;
++		if (count == max || kstrtouint(tok, 10, &val)) {
++			kfree(list);
++			return -EINVAL;
++		}
++		out[count++] = val;
++	}
++	kfree(list);
++
++	*n = count;
++	return 0;
++}
++
++static ssize_t efficient_freq_show(struct gov_attr_set *attr_set, char *buf)
++{
++	struct smut_tunables *tunables = to_smut_tunables(attr_set);
++	unsigned int i;
++	ssize_t n = 0;
++
++	for (i = 0; i < tunables->nefficient_freq; i++)
++		n += scnprintf(buf + n, SMUT_LADDER_TEXT - n, "%u ",
++			       tunables->efficient_freq[i]);
++
++	if (n)
++		n--;			/* drop the trailing space */
++
++	return n + scnprintf(buf + n, SMUT_LADDER_TEXT - n, "\n");
++}
++
++static ssize_t efficient_freq_store(struct gov_attr_set *attr_set,
++				    const char *buf, size_t count)
++{
++	struct smut_tunables *tunables = to_smut_tunables(attr_set);
++	struct smut_policy *sg_policy;
++	unsigned int list[SMUT_LADDER_MAX], n;
++	unsigned int *new, *old;
++	int ret;
++
++	ret = smut_parse_list(list, SMUT_LADDER_MAX, buf, &n);
++	if (ret)
++		return ret;
++
++	new = kcalloc(n ? n : 1, sizeof(*new), GFP_KERNEL);
++	if (!new)
++		return -ENOMEM;
++	memcpy(new, list, n * sizeof(*new));
++
++	mutex_lock(&smut_ladder_lock);
++
++	old = tunables->efficient_freq;
++	WRITE_ONCE(tunables->efficient_freq, new);
++	WRITE_ONCE(tunables->nefficient_freq, n);
++
++	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
++		smut_ladder_rebuild(sg_policy);
++
++	mutex_unlock(&smut_ladder_lock);
++	kfree(old);
++
++	return count;
++}
++
++static ssize_t up_delay_show(struct gov_attr_set *attr_set, char *buf)
++{
++	struct smut_tunables *tunables = to_smut_tunables(attr_set);
++	unsigned int i;
++	ssize_t n = 0;
++
++	for (i = 0; i < tunables->nup_delay; i++)
++		n += scnprintf(buf + n, SMUT_LADDER_TEXT - n, "%u ",
++			       (unsigned int)(tunables->up_delay[i] /
++					      NSEC_PER_MSEC));
++
++	if (n)
++		n--;			/* drop the trailing space */
++
++	return n + scnprintf(buf + n, SMUT_LADDER_TEXT - n, "\n");
++}
++
++static ssize_t up_delay_store(struct gov_attr_set *attr_set,
++			      const char *buf, size_t count)
++{
++	struct smut_tunables *tunables = to_smut_tunables(attr_set);
++	struct smut_policy *sg_policy;
++	unsigned int list[SMUT_LADDER_MAX], n, i;
++	u64 *new, *old;
++	int ret;
++
++	ret = smut_parse_list(list, SMUT_LADDER_MAX, buf, &n);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < n; i++)
++		if (list[i] > SMUT_UP_DELAY_LIM)
++			return -EINVAL;
++
++	new = kcalloc(n ? n : 1, sizeof(*new), GFP_KERNEL);
++	if (!new)
++		return -ENOMEM;
++
++	/* Written in milliseconds, kept in nanoseconds like the rate limits. */
++	for (i = 0; i < n; i++)
++		new[i] = (u64)list[i] * NSEC_PER_MSEC;
++
++	mutex_lock(&smut_ladder_lock);
++
++	old = tunables->up_delay;
++	WRITE_ONCE(tunables->up_delay, new);
++	WRITE_ONCE(tunables->nup_delay, n);
++
++	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
++		smut_ladder_rebuild(sg_policy);
++
++	mutex_unlock(&smut_ladder_lock);
++	kfree(old);
++
++	return count;
++}
++
++static struct governor_attr efficient_freq = __ATTR_RW(efficient_freq);
++static struct governor_attr up_delay = __ATTR_RW(up_delay);
++
 +static struct attribute *smut_attrs[] = {
 +	&up_rate_limit_us.attr,
 +	&down_rate_limit_us.attr,
@@ -1418,6 +1919,8 @@ index 000000000000..eee3eaa6a111
 +	&cap_mid_power.attr,
 +	&cap_heavy_power.attr,
 +	&latency_weight.attr,
++	&efficient_freq.attr,
++	&up_delay.attr,
 +	NULL
 +};
 +ATTRIBUTE_GROUPS(smut);
@@ -1425,8 +1928,11 @@ index 000000000000..eee3eaa6a111
 +static void smut_tunables_free(struct kobject *kobj)
 +{
 +	struct gov_attr_set *attr_set = to_gov_attr_set(kobj);
++	struct smut_tunables *tunables = to_smut_tunables(attr_set);
 +
-+	kfree(to_smut_tunables(attr_set));
++	kfree(tunables->efficient_freq);
++	kfree(tunables->up_delay);
++	kfree(tunables);
 +}
 +
 +static const struct kobj_type smut_tunables_ktype = {
@@ -1507,7 +2013,10 @@ index 000000000000..eee3eaa6a111
 +	}
 +
 +	sg_policy->thread = thread;
-+	kthread_bind_mask(thread, policy->related_cpus);
++	if (policy->dvfs_possible_from_any_cpu)
++		set_cpus_allowed_ptr(thread, policy->related_cpus);
++	else
++		kthread_bind_mask(thread, policy->related_cpus);
 +	init_irq_work(&sg_policy->irq_work, smut_irq_work);
 +	mutex_init(&sg_policy->work_lock);
 +
@@ -1694,16 +2203,28 @@ index 000000000000..eee3eaa6a111
 +	unsigned int cpu;
 +
 +	sg_policy->up_rate_delay_ns =
-+		sg_policy->tunables->up_rate_limit_us * NSEC_PER_USEC;
++		(s64)sg_policy->tunables->up_rate_limit_us * NSEC_PER_USEC;
 +	sg_policy->down_rate_delay_ns =
-+		sg_policy->tunables->down_rate_limit_us * NSEC_PER_USEC;
++		(s64)sg_policy->tunables->down_rate_limit_us * NSEC_PER_USEC;
 +	smut_update_min_rate_limit_ns(sg_policy);
 +	smut_speed_floors(sg_policy);
++
++	/*
++	 * The ladder starts from the bottom rung on every start, so a policy
++	 * that was stopped mid-climb does not resume above a rung it has not
++	 * paid for.
++	 */
++	sg_policy->step = 0;
++	sg_policy->step_since = 0;
++	mutex_lock(&smut_ladder_lock);
++	smut_ladder_rebuild(sg_policy);
++	mutex_unlock(&smut_ladder_lock);
++
 +	sg_policy->last_freq_update_time	= 0;
 +	sg_policy->next_freq			= 0;
 +	sg_policy->work_in_progress		= false;
 +	sg_policy->limits_changed		= false;
-+	sg_policy->cached_raw_freq		= 0;
++	sg_policy->cached_raw_freq		= UINT_MAX;
 +
 +	sg_policy->need_freq_update = cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS);
 +
@@ -1761,7 +2282,21 @@ index 000000000000..eee3eaa6a111
 +	/* cpuinfo.max_freq, which the cube-law floor scales, may have moved */
 +	smut_speed_floors(sg_policy);
 +
-+	sg_policy->limits_changed = true;
++	/* So may policy->min/max, which the ladder's rungs were clamped to. */
++	mutex_lock(&smut_ladder_lock);
++	smut_ladder_rebuild(sg_policy);
++	mutex_unlock(&smut_ladder_lock);
++
++	/*
++	 * The limits_changed update below must take place before the updates
++	 * of policy limits in cpufreq_set_policy() or a policy limits update
++	 * might be missed, so use a memory barrier to ensure it.
++	 *
++	 * This pairs with the memory barrier in smut_should_update_freq().
++	 */
++	smp_wmb();
++
++	WRITE_ONCE(sg_policy->limits_changed, true);
 +}
 +
 +struct cpufreq_governor smartutil_gov = {
@@ -1781,10 +2316,10 @@ index 000000000000..eee3eaa6a111
 +MODULE_LICENSE("GPL");
 +MODULE_DESCRIPTION(CPUFREQ_SMARTUTIL_PROGNAME);
 diff --git a/include/linux/sched/cpufreq.h b/include/linux/sched/cpufreq.h
-index bdd31ab93bc5..08d8b569ab76 100644
+index bdd31ab93bc5..955132a28277 100644
 --- a/include/linux/sched/cpufreq.h
 +++ b/include/linux/sched/cpufreq.h
-@@ -33,6 +33,17 @@ static inline unsigned long map_util_perf(unsigned long util)
+@@ -33,6 +33,18 @@ static inline unsigned long map_util_perf(unsigned long util)
  {
  	return util + (util >> 2);
  }
@@ -1794,6 +2329,7 @@ index bdd31ab93bc5..08d8b569ab76 100644
 + * headers.
 + */
 +unsigned long cpufreq_cpu_dl_bw(int cpu);
++bool cpufreq_rq_is_capped(int cpu);
 +unsigned long effective_cpu_util(int cpu, unsigned long util,
 +				 unsigned long *min, unsigned long *max);
 +unsigned long cpu_util_cfs_boost(int cpu);
@@ -1803,10 +2339,10 @@ index bdd31ab93bc5..08d8b569ab76 100644
  
  #endif /* _LINUX_SCHED_CPUFREQ_H */
 diff --git a/kernel/sched/cpufreq.c b/kernel/sched/cpufreq.c
-index 29e4e0d84452..8947652223ea 100644
+index 29e4e0d84452..cd5b5588f07e 100644
 --- a/kernel/sched/cpufreq.c
 +++ b/kernel/sched/cpufreq.c
-@@ -74,3 +74,16 @@ bool cpufreq_this_cpu_can_update(struct cpufreq_policy *policy)
+@@ -74,3 +74,31 @@ bool cpufreq_this_cpu_can_update(struct cpufreq_policy *policy)
  		 rcu_dereference_sched(*this_cpu_ptr(&cpufreq_update_util_data)));
  }
  EXPORT_SYMBOL_GPL(cpufreq_this_cpu_can_update);
@@ -1822,6 +2358,21 @@ index 29e4e0d84452..8947652223ea 100644
 +unsigned long cpufreq_cpu_dl_bw(int cpu)
 +{
 +	return cpu_bw_dl(cpu_rq(cpu));
++}
++
++/**
++ * cpufreq_rq_is_capped - whether a CPU's runqueue is capped by uclamp_max.
++ * @cpu: the CPU in question.
++ *
++ * uclamp_rq_is_capped() is a static inline in kernel/sched/sched.h, for
++ * the same reason cpu_bw_dl() is: a governor compiled as its own object
++ * in drivers/cpufreq/ cannot reach it.  Governors need it to tell a dip
++ * in utilization they should ride out from one they should honour -- a
++ * ceiling the user asked for is not a dip.
++ */
++bool cpufreq_rq_is_capped(int cpu)
++{
++	return uclamp_rq_is_capped(cpu_rq(cpu));
 +}
 diff --git a/kernel/sched/pelt.c b/kernel/sched/pelt.c
 index c1c84f5a3c03..01b867aad9f6 100644
@@ -1848,6 +2399,3 @@ index c1c84f5a3c03..01b867aad9f6 100644
  static u32 __accumulate_pelt_segments(u64 periods, u32 d1, u32 d3)
  {
  	u32 c1, c2, c3 = d3; /* y^0 == 1 */
--- 
-2.56.0
-
